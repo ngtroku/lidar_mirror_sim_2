@@ -9,13 +9,16 @@
     "visualize": true
   },
   "simulation": {
-    "distance": 1.5,
-    "n_trials": 100
+    "distance": 1.0,
+    "n_trials": 500
   },
   "lidar": {
     "lidar_topic": "/velodyne_points",
     "topic_length": 22,
     "frequency": 10
+  },
+  "imu": {
+    "imu_topic": "/imu"
   },
   "mirror": {
     "width": 2.0,

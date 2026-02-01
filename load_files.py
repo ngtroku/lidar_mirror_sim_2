@@ -81,7 +81,7 @@ def save_results(optimization):
     
     # 2. ファイル名を生成 (optimization_results_日時.csv)
     filename = f"optimization_results_{timestamp}.csv"
-    optimization_csv = Path("./") / filename
+    optimization_csv = Path("./results") / filename
     
     # Optunaの全試行データをpandas DataFrameとして取得
     df_results = optimization.trials_dataframe()

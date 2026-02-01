@@ -1,7 +1,8 @@
 import numpy as np
 import open3d as o3d
-import time, json, subprocess
+import json, subprocess, time
 from pathlib import Path
+from datetime import datetime
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial import KDTree
@@ -19,6 +20,7 @@ import preprocessing
 import postprocess
 import objective_function
 import eigen_decomposition
+import error_estimate
 
 def get_mirror_orientation_yaw(mirror_pos_x, mirror_pos_y):
     # load config
@@ -152,7 +154,44 @@ def create_pointcloud2(points, seq, stamp_ns, frame_id, typestore):
                        is_bigendian=False, point_step=12, row_step=12 * points.shape[0],
                        data=data_array, is_dense=True)
 
-def generate_rosbag(param_x=8.0, param_y=0.0, param_yaw_center=0.0, param_swing_speed=0.0, param_swing_range=0.0):
+def debug_visualize_2d(sensor_pos, lidar_points, mirror_center, mirror_yaw, p_virtual):
+
+    plt.clf() # 画面をクリア
+    
+    # 1. 周辺点群（グレー）
+    plt.scatter(lidar_points[:, 0], lidar_points[:, 1], s=1, c='gray', alpha=0.3, label='Environment')
+    
+    # 2. センサー位置（青）
+    plt.scatter(sensor_pos[0], sensor_pos[1], s=50, c='blue', marker='o', label='Sensor')
+    
+    # 3. 鏡の位置（赤の×）と向き
+    plt.scatter(mirror_center[0], mirror_center[1], s=100, c='red', marker='x', label='Mirror')
+    
+    # 鏡の向きを線で表示（鏡の面）
+    # yawに対して垂直なのが鏡の面方向
+    mirror_rad = np.radians(mirror_yaw)
+    # 鏡の幅を3mと仮定して表示
+    m_half_w = 1.5
+    dx = m_half_w * np.cos(mirror_rad + np.pi/2)
+    dy = m_half_w * np.sin(mirror_rad + np.pi/2)
+    plt.plot([mirror_center[0] - dx, mirror_center[0] + dx], 
+             [mirror_center[1] - dy, mirror_center[1] + dy], 'r-', linewidth=2)
+    
+    # 鏡の法線（反射の向きを確認するため）
+    nx = 1.0 * np.cos(mirror_rad)
+    ny = 1.0 * np.sin(mirror_rad)
+    plt.arrow(mirror_center[0], mirror_center[1], nx, ny, head_width=0.3, fc='r', ec='r')
+
+    # 4. 反射点群（赤）
+    if p_virtual.size > 0:
+        plt.scatter(p_virtual[:, 0], p_virtual[:, 1], s=2, c='red', label='Virtual Points')
+
+    plt.axis('equal')
+    plt.legend(loc='upper right')
+    plt.grid(True, linestyle=':', alpha=0.5)
+    plt.pause(0.01) # 短い一時停止でアニメーション表示
+
+def generate_rosbag(param_x=0.0, param_y=0.0, param_yaw_center=0.0, param_swing_speed=0.0, param_swing_range=0.0, debug=False):
     with open('config.json', 'r') as f:
         config = json.load(f)
 
@@ -160,6 +199,7 @@ def generate_rosbag(param_x=8.0, param_y=0.0, param_yaw_center=0.0, param_swing_
     output_bag_path = Path(config['main']['output_bag'])
     lidar_topic_in = config['lidar']['lidar_topic']
     lidar_topic_out = config['lidar']['lidar_topic']
+    imu_topic = config['imu']['imu_topic']
     topic_length = config['lidar']['topic_length']
     lidar_freq = config['lidar']['frequency']
 
@@ -180,39 +220,60 @@ def generate_rosbag(param_x=8.0, param_y=0.0, param_yaw_center=0.0, param_swing_
     with AnyReader([bag_path], default_typestore=typestore) as reader:
         with Writer(output_bag_path) as writer:
             lidar_conn_out = writer.add_connection(lidar_topic_out, 'sensor_msgs/msg/PointCloud2', typestore=typestore)
-            connections = [x for x in reader.connections if x.topic == lidar_topic_in]
+            imu_conn_out = writer.add_connection(imu_topic, 'sensor_msgs/msg/Imu', typestore=typestore)
+
+            connections = [x for x in reader.connections if x.topic == lidar_topic_in or x.topic == imu_topic]
 
             for connection, timestamp, rawdata in reader.messages(connections=connections):
-                if cnt >= max_frame_seq: break
-                
+
                 msg = reader.deserialize(rawdata, connection.msgtype)
                 msg_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
 
-                iteration = int(msg.data.shape[0]/topic_length)
-                bin_points = np.frombuffer(msg.data, dtype=np.uint8).reshape(iteration, topic_length)
-                lx, ly, lz = binary_to_xyz(bin_points)
-                local_points = np.vstack((lx, ly, lz)).T
+                if connection.topic == imu_topic:
+                    writer.write(imu_conn_out, msg_ns, rawdata)
+                    continue
 
-                sensor_pos = [gt_x[cnt], gt_y[cnt], gt_z[cnt]]
-                sensor_quat = [gt_qw[cnt], gt_qx[cnt], gt_qy[cnt], gt_qz[cnt]]
-                wx, wy, wz = coord_trans.local_to_world(local_points, sensor_pos, sensor_quat)
-                lidar_points_world = np.vstack((wx, wy, wz)).T
+                elif connection.topic == lidar_topic_in:
 
-                is_reflected = faster_check_intersection(lidar_points_world, mirror_center, mirror_width, mirror_height, param_yaw_center, sensor_pos)
-                P_visible = lidar_points_world[~is_reflected]
+                    if cnt >= max_frame_seq:
+                        continue
 
-                m_yaw = decide_mirror_yaw_triangular(param_yaw_center, param_swing_range, param_swing_speed, cnt / lidar_freq)
-                y_rad = np.deg2rad(m_yaw)
-                Rz = np.array([[np.cos(y_rad), -np.sin(y_rad), 0], [np.sin(y_rad), np.cos(y_rad), 0], [0, 0, 1]])
+                    msg = reader.deserialize(rawdata, connection.msgtype)
+                    msg_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
 
-                P_virtual, _ = reflection_sim(lidar_points_world, sensor_pos, sensor_quat, mirror_center, mirror_width, mirror_height, Rz)
-                sim_world = np.vstack((P_visible, P_virtual))
-                sim_local = coord_trans.world_to_local(sim_world, sensor_pos, sensor_quat)
+                    iteration = int(msg.data.shape[0]/topic_length)
+                    bin_points = np.frombuffer(msg.data, dtype=np.uint8).reshape(iteration, topic_length)
+                    lx, ly, lz = binary_to_xyz(bin_points)
+                    local_points = np.vstack((lx, ly, lz)).T
 
-                out_msg = create_pointcloud2(sim_local, cnt, msg_ns, msg.header.frame_id, typestore)
-                serialized_msg = typestore.serialize_ros1(out_msg, lidar_conn_out.msgtype)
-                writer.write(lidar_conn_out, msg_ns, serialized_msg)
-                cnt += 1
+                    sensor_pos = [gt_x[cnt], gt_y[cnt], gt_z[cnt]]
+                    sensor_quat = [gt_qw[cnt], gt_qx[cnt], gt_qy[cnt], gt_qz[cnt]]
+                    wx, wy, wz = coord_trans.local_to_world(local_points, sensor_pos, sensor_quat)
+                    lidar_points_world = np.vstack((wx, wy, wz)).T
+
+                    is_reflected = faster_check_intersection(lidar_points_world, mirror_center, mirror_width, mirror_height, param_yaw_center, sensor_pos)
+                    P_visible = lidar_points_world[~is_reflected]
+
+                    m_yaw = decide_mirror_yaw_triangular(param_yaw_center, param_swing_range, param_swing_speed, cnt / lidar_freq)
+                    y_rad = np.deg2rad(m_yaw)
+                    Rz = np.array([[np.cos(y_rad), -np.sin(y_rad), 0], [np.sin(y_rad), np.cos(y_rad), 0], [0, 0, 1]])
+
+                    P_virtual, _ = reflection_sim(lidar_points_world, sensor_pos, sensor_quat, mirror_center, mirror_width, mirror_height, Rz)
+                    #print(P_virtual.shape)
+                    sim_world = np.vstack((P_visible, P_virtual))
+                    sim_local = coord_trans.world_to_local(sim_world, sensor_pos, sensor_quat)
+
+                    # simulation debug
+                    if debug:
+                        debug_visualize_2d(sensor_pos=sensor_pos[:2], lidar_points=sim_world, mirror_center=mirror_center[:2], 
+                                mirror_yaw=m_yaw, p_virtual=P_virtual)
+                    else:
+                        pass
+
+                    out_msg = create_pointcloud2(sim_local, cnt, msg_ns, msg.header.frame_id, typestore)
+                    serialized_msg = typestore.serialize_ros1(out_msg, lidar_conn_out.msgtype)
+                    writer.write(lidar_conn_out, msg_ns, serialized_msg)
+                    cnt += 1
 
 def run_slam(algorithm='kiss_icp'):
     cmd = ["roslaunch", "slamspoof", "mirror_sim_kiss.launch"] if algorithm == 'kiss_icp' else ["roslaunch", "slamspoof", "mirror_sim_flio.launch"]
@@ -237,6 +298,7 @@ def objective(trial):
     # 3. 最近傍の点群を読み込み
     nearest_points = load_files.load_nearest_pcd(idx)
     anisotropy, angle = eigen_decomposition.eigen_value_decomposition_2d(nearest_points) # 局在度と長手方向を求める
+    #print(f"angle:{angle}deg")
 
     # 最近傍点からの距離を設定(config)
     dist = float(config['simulation']['distance'])
@@ -247,9 +309,10 @@ def objective(trial):
 
     # 設置座標 (真上)
     mx = dist * np.cos(np.deg2rad(mirror_placement_yaw)) + gt_x[idx] # 鏡の位置(x)
-    my = dist + np.sin(np.deg2rad(mirror_placement_yaw)) + gt_y[idx] # 鏡の位置(y)
+    my = dist * np.sin(np.deg2rad(mirror_placement_yaw)) + gt_y[idx] # 鏡の位置(y)
 
-    m_yaw = angle # 長手方向を向くように設定
+    #m_yaw = angle # 長手方向を向くように設定
+    m_yaw = trial.suggest_float('mirror_yaw', -180.0, 180.0) 
        
     # 4. その他の最適化パラメータ
     #speed = trial.suggest_float('mirror_swing_speed', 0.0, 20.0)
@@ -269,16 +332,18 @@ def objective(trial):
         return 0.0
 
 if __name__ == "__main__":
+    start = time.time()
+    # 1. rosbagからpcdファイル生成
+    #preprocessing.rosbag_writer()
 
-    # rosbagからpcdファイル生成
-    preprocessing.rosbag_writer()
-
-    # 最適化開始
+    # 2. 最適化の実行
     with open('config.json', 'r') as f:
         config = json.load(f)
 
     n_trials = int(config['simulation']['n_trials'])
+    n_random_trials = int(n_trials) * 0.30
 
+    #study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(n_startup_trials=n_random_trials))
     study = optuna.create_study(direction='maximize')
     study.optimize(objective, n_trials=n_trials)
 
@@ -293,59 +358,71 @@ if __name__ == "__main__":
 
     if bool(config['main']['save_study_result']):
         load_files.save_results(study)
-    else:
-        pass
 
-    # ベストパラメータでSLAMを実行
+    # --- 3. ベストパラメータの抽出と最終実行準備 ---
     best_trial = study.best_trial
+    
+    # user_attrs から座標を取得
     best_x = best_trial.user_attrs["mx"]
     best_y = best_trial.user_attrs["my"]
-    best_yaw = best_trial.user_attrs["calculated_yaw"]
-    best_speed = 7.0
+    
+    best_yaw = best_trial.params["mirror_yaw"] 
+    #best_yaw = best_trial.user_attrs["calculated_yaw"]
+    best_speed = 7.0 # 固定値
 
+    #objective_function.simulator(best_x, best_y, best_yaw, param_swing_speed=best_speed, param_swing_range=120, debug=True)
+    #generate_rosbag(param_x=best_x, param_y=best_y, param_yaw_center=best_yaw, 
+    #                param_swing_speed=best_speed, param_swing_range=120.0, debug=True)
+
+    # 4. ベストパラメータで最終ROSバッグを生成
+    print(f"ベスト位置({best_x:.2f}, {best_y:.2f})・方位({best_yaw:.2f}°)で最終生成中...")
     generate_rosbag(param_x=best_x, param_y=best_y, param_yaw_center=best_yaw, 
                     param_swing_speed=best_speed, param_swing_range=120.0)
     
-    run_slam()
+    # 5. SLAMを実行して軌跡ファイルを生成
+    run_slam(algorithm='kiss_icp')
 
-    # 評価用にファイル呼び出し
-    gt = config['main']['gt_path']
-    gt_x, gt_y, gt_z, gt_qw, gt_qx, gt_qy, gt_qz = load_files.load_benign_pose(gt)
+    # --- 6. 結果の可視化 (プロット) ---
+    gt_x, gt_y, gt_z, gt_qw, gt_qx, gt_qy, gt_qz = load_files.load_benign_pose(config['main']['gt_path']) # クオータニオンの並びはw, x, y, z
+    
+    # SLAMの出力パスをconfigから読み込み
+    est_path = config['main']['est_path']
+    est_x, est_y, est_z, est_qw, est_qx, est_qy, est_qz = load_files.load_benign_pose(est_path)
 
-    est = config['main']['est_path']
-    est_x, est_y, est_z, est_qw, est_qx, est_qy, est_qz = load_files.load_benign_pose(est)
-
-    # プロット
-    # 1. スタイルをデフォルトに戻す
     plt.rcdefaults()
-
-    # 2. フィギュアと軸の作成
     fig, ax = plt.subplots(figsize=(10, 6), layout='constrained')
 
-    # 3. 軌跡のプロット
-    ax.plot(gt_x, gt_y, color='black', linestyle='--', linewidth=1.5, alpha=0.5, label='Ground Truth (Benign)')
-    ax.plot(est_x, est_y, color='blue', linewidth=2.0, label='Estimated Trajectory (Spoofed)')
+    ax.plot(gt_x, gt_y, color='black', linestyle='--', linewidth=1.5, alpha=0.5, label='Ground Truth')
+    ax.plot(est_x, est_y, color='blue', linewidth=2.0, label='Spoofed Trajectory')
 
-    # 4. ベスト設置位置をスターマーカーで表示
-    ax.scatter(best_x, best_y, color='red', marker='*', s=300, edgecolor='darkred', zorder=5, label=f'Best Mirror')
+    # ベスト設置位置
+    ax.scatter(best_x, best_y, color='red', marker='*', s=300, edgecolor='darkred', zorder=5, label='Best Mirror')
 
-    # 5. 矢印で鏡の向き(yaw)を表示
-    arrow_length = 10.0 
+    # 鏡の向きを矢印で表示
+    arrow_length = 5.0 
     rad = np.radians(best_yaw)
-    dx_arrow = arrow_length * np.cos(rad)
-    dy_arrow = arrow_length * np.sin(rad)
-    
-    ax.arrow(best_x, best_y, dx_arrow, dy_arrow, width=0.8, head_width=3.5, head_length=4.5, 
-             fc='red', ec='red', alpha=0.8, zorder=6, label='Mirror Orientation')
+    ax.arrow(best_x, best_y, arrow_length * np.cos(rad), arrow_length * np.sin(rad), 
+             width=0.5, head_width=2.0, head_length=2.5, fc='red', ec='red', alpha=0.8, zorder=6)
 
-    # 6. グラフの装飾
-    ax.set_title(f"SLAM Trajectory with Path-Aligned Mirror\nBest Score: {study.best_value:.4f}", fontsize=14)
+    ax.set_title(f"SLAM Optimization Result\nBest Score: {study.best_value:.4f}")
     ax.set_xlabel("X [m]")
     ax.set_ylabel("Y [m]")
     ax.legend(loc='upper right')
     ax.grid(True, linestyle=':', alpha=0.6)
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"slam_result_{timestamp}.png"
+
+    # savefigはshowの前に呼ぶ必要があります
+    plt.savefig(filename, dpi=150)
+    print(f"プロットを保存しました: {filename}")
+    print(f"Processing time :{time.time()-start}sec")
+
     plt.show()
 
-    # 作成したpcdファイルを削除
-    postprocess.cleanup_files()
+    # 位置ずれを定量的に評価
+    RPE = error_estimate.evo_rpe_eval_results(config['main']['gt_path'], config['main']['est_path'])
+    print(f"RPE is {RPE} m")
+
+    # 7. クリーンアップ
+    #postprocess.cleanup_files()

@@ -292,8 +292,45 @@ def get_sensor_height(gt_x, gt_y, gt_z, mirror_pos_x, mirror_pos_y):
     
     else:
         return 0
+    
+def debug_visualize_2d(sensor_pos, lidar_points, mirror_center, mirror_yaw, p_virtual):
 
-def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_swing_range=120):
+    plt.clf() # 画面をクリア
+    
+    # 1. 周辺点群（グレー）
+    plt.scatter(lidar_points[:, 0], lidar_points[:, 1], s=1, c='gray', alpha=0.3, label='Environment')
+    
+    # 2. センサー位置（青）
+    plt.scatter(sensor_pos[0], sensor_pos[1], s=50, c='blue', marker='o', label='Sensor')
+    
+    # 3. 鏡の位置（赤の×）と向き
+    plt.scatter(mirror_center[0], mirror_center[1], s=100, c='red', marker='x', label='Mirror')
+    
+    # 鏡の向きを線で表示（鏡の面）
+    # yawに対して垂直なのが鏡の面方向
+    mirror_rad = np.radians(mirror_yaw)
+    # 鏡の幅を3mと仮定して表示
+    m_half_w = 1.5
+    dx = m_half_w * np.cos(mirror_rad + np.pi/2)
+    dy = m_half_w * np.sin(mirror_rad + np.pi/2)
+    plt.plot([mirror_center[0] - dx, mirror_center[0] + dx], 
+             [mirror_center[1] - dy, mirror_center[1] + dy], 'r-', linewidth=2)
+    
+    # 鏡の法線（反射の向きを確認するため）
+    nx = 1.0 * np.cos(mirror_rad)
+    ny = 1.0 * np.sin(mirror_rad)
+    plt.arrow(mirror_center[0], mirror_center[1], nx, ny, head_width=0.3, fc='r', ec='r')
+
+    # 4. 反射点群（赤）
+    if p_virtual.size > 0:
+        plt.scatter(p_virtual[:, 0], p_virtual[:, 1], s=2, c='red', label='Virtual Points')
+
+    plt.axis('equal')
+    plt.legend(loc='upper right')
+    plt.grid(True, linestyle=':', alpha=0.5)
+    plt.pause(0.01) # 短い一時停止でアニメーション表示
+
+def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_swing_range=120, debug=False):
 
     # --- 設定読み込み ---
     with open('config.json', 'r') as f: conditions = json.load(f)
@@ -323,6 +360,7 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
     occlusion_score_num = 0
     reflect_score_num = 0
     anisotropic_score_num = 0
+    rotation_score_num = 0
     
     # GTの1フレーム目から初期姿勢行列を作成
     initial_pos = np.array([gt_x[0], gt_y[0], gt_z[0]])
@@ -389,12 +427,13 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
 
                     P_virtual_raw, _ = reflection_sim(lidar_points_world, sensor_pos, sensor_quat, 
                                                         mirror_center, mirror_width, mirror_height, Rz)
+                    
+                    simulated_points = np.vstack((P_visible, P_virtual_raw))
+                    #sim_local = coord_trans.world_to_local(simulated_points, sensor_pos, sensor_quat)
 
-                    if P_virtual_raw.shape[0] != 0:
+                    reflect_score = P_virtual_raw.shape[0] / N_total  # 鏡像反射により注入される点群数
 
-                        reflect_score = P_virtual_raw.shape[0] / N_total  # 鏡像反射により注入される点群数
-
-                        reflect_score_num += reflect_score # SMVSの値が小さいほど脆弱な環境なので、smvsが大きいほどscoreを小さくする
+                    reflect_score_num += reflect_score # SMVSの値が小さいほど脆弱な環境なので、smvsが大きいほどscoreを小さくする
 
                     # 局在性の評価
                     anisotropy, angle = eigen_decomposition.eigen_value_decomposition_2d(local_points)
@@ -402,8 +441,23 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
                     anisotropic_score = weight * anisotropy
                     anisotropic_score_num += anisotropic_score
 
+                    # yaw stability 方向転換中だと脆弱になりやすい
+                    yaw_stability = gt_qw[load_num] - np.abs(gt_qz[load_num]) # yaw 方向の方向転換の激しさ
+                    stability_score = weight * yaw_stability
+                    rotation_score_num += stability_score
+
+                    #print(f"frame:{cnt}:occlusion score:{occlusion_score:.4f}, reflection score:{reflect_score:.4f}, stability score:{stability_score:.4f}")
+
+                    # simulation debug
+                    if debug:
+                        debug_visualize_2d(sensor_pos=sensor_pos[:2], lidar_points=simulated_points, mirror_center=mirror_center[:2], 
+                                mirror_yaw=mirror_yaw, p_virtual=P_virtual_raw)
+                    else:
+                        pass
+
                     load_num += 1
                     cnt += 1
 
-    overall_score = occlusion_score_num + reflect_score_num + anisotropic_score_num 
+    #overall_score = occlusion_score_num + reflect_score_num + anisotropic_score_num - rotation_score_num
+    overall_score = occlusion_score_num + reflect_score_num - rotation_score_num
     return overall_score
