@@ -284,6 +284,10 @@ def run_slam(algorithm='kiss_icp'):
     except Exception as e:
         print(f"SLAMエラー: {e}")
 
+def calc_rotation_factor(qw, qz):
+    stability_score = qw - np.abs(qz)
+    return stability_score
+
 def objective(trial):
     # 1. Trajectoryデータの読み込み
     with open('config.json', 'r') as f:
@@ -291,6 +295,7 @@ def objective(trial):
 
     gt = config['main']['gt_path']
     gt_x, gt_y, gt_z, gt_qw, gt_qx, gt_qy, gt_qz = load_files.load_benign_pose(gt)
+    matching_factor = calc_rotation_factor(gt_qw, gt_qz)
 
     # 2. 設置するインデックスを提案
     idx = trial.suggest_int('gt_index', 0, len(gt_x) - 1)
@@ -304,7 +309,7 @@ def objective(trial):
     dist = float(config['simulation']['distance'])
 
     # 鏡のyaw角 : 長手方向から90度回転
-    mirror_placement_yaw_temp = angle - 90
+    mirror_placement_yaw_temp = angle + 90
     mirror_placement_yaw = (mirror_placement_yaw_temp + 180) % 360 - 180 # 鏡の向き
 
     # 設置座標 (真上)
@@ -334,7 +339,7 @@ def objective(trial):
 if __name__ == "__main__":
     start = time.time()
     # 1. rosbagからpcdファイル生成
-    #preprocessing.rosbag_writer()
+    preprocessing.rosbag_writer()
 
     # 2. 最適化の実行
     with open('config.json', 'r') as f:
@@ -411,7 +416,7 @@ if __name__ == "__main__":
     ax.grid(True, linestyle=':', alpha=0.6)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"slam_result_{timestamp}.png"
+    filename = f"./images/slam_result_{timestamp}.png"
 
     # savefigはshowの前に呼ぶ必要があります
     plt.savefig(filename, dpi=150)
@@ -425,4 +430,4 @@ if __name__ == "__main__":
     print(f"RPE is {RPE} m")
 
     # 7. クリーンアップ
-    #postprocess.cleanup_files()
+    postprocess.cleanup_files()

@@ -3,6 +3,7 @@ import open3d as o3d
 import time, json
 from pathlib import Path
 import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter, medfilt
 from scipy.spatial.transform import Rotation as R
 
 # rosbags libraries
@@ -114,18 +115,14 @@ def faster_check_intersection(point_cloud_data: np.ndarray, center: list, width:
     ])
     
     # 鏡の法線ベクトル（世界座標系）
+    # このベクトルが向いている方が「表面」
     normal_world = Rz @ np.array([0, 1, 0])
     
     # 2. 光線の計算
-    # 各点 P に対して ray_direction = P - O
     ray_directions = point_cloud_data - O  # (N, 3)
     
     # 3. 交点パラメータ t の一括計算
-    # 線の式: L = O + t * ray_direction
-    # 面の式: (L - C)・normal_world = 0
-    # t = ((C - O)・normal_world) / (ray_direction・normal_world)
-    
-    # 分母 (N,)
+    # 分母 (N,) : 光線ベクトルと法線ベクトルの内積
     denominators = ray_directions @ normal_world
     
     # 分子 (スカラー)
@@ -135,17 +132,15 @@ def faster_check_intersection(point_cloud_data: np.ndarray, center: list, width:
     valid_mask = np.abs(denominators) > 1e-6
     
     # t を計算 (N,)
-    # 有効な分母以外は一旦 0 にして計算し、後でマスクをかける
     t = np.zeros_like(denominators)
     t[valid_mask] = numerator / denominators[valid_mask]
     
-    # 4. 範囲チェック (t の条件)
+    # 4. 範囲チェック (t の条件) + 【追加】表面判定
     # 0 < t <= 1.0 : センサーと点 P の間に鏡がある
-    t_mask = valid_mask & (t > 0.0) & (t <= 1.0)
+    # denominators < 0 : ビームが法線と逆方向（＝鏡の表側）から入射している
+    t_mask = valid_mask & (t > 0.0) & (t <= 1.0) & (denominators < 0)
     
     # 5. 交点の世界座標を計算
-    # I = O + t * ray_direction (対象となる点のみ)
-    # 効率化のため、t_mask が True の点だけ計算する
     indices = np.where(t_mask)[0]
     if len(indices) == 0:
         return np.zeros(point_cloud_data.shape[0], dtype=bool)
@@ -153,9 +148,7 @@ def faster_check_intersection(point_cloud_data: np.ndarray, center: list, width:
     I_world = O + t[indices, np.newaxis] * ray_directions[indices]
     
     # 6. 鏡のローカル座標系への変換と境界チェック
-    # I_local = Rz^T @ (I_world - C)
     I_local_shifted = I_world - C
-    # 行列演算で一括変換 (I_local_shifted @ Rz は 各行ベクトル v に v @ Rz を適用することと同等)
     I_local = I_local_shifted @ Rz
     
     x_local = I_local[:, 0]
@@ -217,58 +210,46 @@ def down_sampling_sim(points, horizontal_res, vertical_res):
 
     return points[unique_indices]
 
-def reflection_sim(points, sensor_pos, sensor_ori, mirror_center, mirror_width, mirror_height, R):
-    # 1. 鏡の法線ベクトルと平面の定義
-    # 鏡のローカル座標でY軸正の方向を表面(法線)と仮定
-    normal_local = np.array([0, 1, 0])
-    normal_world = R @ normal_local
+def reflection_sim(points, sensor_pos, mirror_center, mirror_width, mirror_height, R):
+    normal_world = R @ np.array([0, 1, 0])
     C = np.array(mirror_center)
     S = np.array(sensor_pos)
 
-    # 2. 仮想センサ位置 (S_v) の計算
-    # センサを鏡面に対して対称移動させる
+    # 1. 【追加】 そもそもセンサが鏡の裏にいたら反射はゼロ
     dist_s = np.dot(S - C, normal_world)
+    if dist_s <= 0:
+        return np.empty((0, 3)), np.empty((0, 3))
+
+    # 2. 仮想センサ位置 (S_v) の計算
     S_v = S - 2 * dist_s * normal_world
 
-    # 3. 反射源の抽出 (仮想センサから見て、鏡の枠内にある点を特定)
-    # 仮想センサから各点へのベクトル
-    O_v = S_v
-    ray_directions = points - O_v
+    # 3. 反射源の抽出
+    ray_directions = points - S_v
+    denominator = ray_directions @ normal_world # (N,)
+    numerator = np.dot(C - S_v, normal_world) # スカラー
     
-    # 鏡面との交差判定: t = (C - O_v)・n / (ray・n)
-    numerator = np.dot(C - O_v, normal_world)
-    denominator = np.dot(ray_directions, normal_world)
-    
-    # 分母が0に近い(面と平行な光線)を除外
     valid_denom = np.abs(denominator) > 1e-6
     t = np.zeros(len(points))
     t[valid_denom] = numerator / denominator[valid_denom]
     
-    # 交点が仮想センサと実体点Pの間にある (0 < t < 1) かつ、センサの「前」にある点のみ対象
-    # (鏡の枠を通して点を見ている条件)
-    mask = (t > 0) & (t < 1.0)
+    # 4. 【追加・修正】 条件の厳格化
+    # t: 0 < t < 1 (センサと点の間に鏡がある)
+    # denominator > 0: 仮想センサ(裏)から点(表)へ向かう光線が法線と同じ向き
+    # (＝鏡を裏から表へ突き抜けている)
+    mask = (t > 0) & (t < 1.0) & (denominator > 0)
     
-    # 交点 I の世界座標
-    I_world = O_v + t[:, np.newaxis] * ray_directions
+    I_world = S_v + t[:, np.newaxis] * ray_directions
+    I_local = (I_world - C) @ R # 行列の形に注意
     
-    # 4. 鏡の枠内(境界)チェック
-    # 交点を鏡のローカル座標に変換
-    I_local = (R.T @ (I_world - C).T).T
-    
-    # 鏡のローカル座標系: x=横幅方向, z=高さ方向 と仮定
-    half_w = mirror_width / 2.0
-    half_h = mirror_height / 2.0
-    
-    in_boundary = (I_local[:, 0] >= -half_w) & (I_local[:, 0] <= half_w) & \
-                  (I_local[:, 2] >= -half_h) & (I_local[:, 2] <= half_h)
+    half_w, half_h = mirror_width / 2.0, mirror_height / 2.0
+    in_boundary = (np.abs(I_local[:, 0]) <= half_w) & (np.abs(I_local[:, 2]) <= half_h)
     
     final_mask = mask & in_boundary
     P_source = points[final_mask]
 
-    # 5. 鏡像 (P_virtual) の生成
-    # 反射源 P_source を鏡面に対して反転させる
-    # P' = P - 2 * ((P - C)・n) * n
+    # 5. 鏡像生成
     if len(P_source) > 0:
+        # P_source は必ず鏡の「表」にある点のみになる
         dist_p = np.sum((P_source - C) * normal_world, axis=1)
         P_virtual = P_source - 2 * dist_p[:, np.newaxis] * normal_world
     else:
@@ -292,6 +273,27 @@ def get_sensor_height(gt_x, gt_y, gt_z, mirror_pos_x, mirror_pos_y):
     
     else:
         return 0
+    
+def filter_by_horizontal_fov(points_world, sensor_pos, sensor_quat, fov_deg):
+    """
+    ワールド座標系の点群を、センサの正面を中心とした水平視野角でフィルタリングする
+    """
+    if fov_deg >= 360.0:
+        return points_world
+        
+    # ワールド座標からローカル座標へ変換
+    local_points = coord_trans.world_to_local(points_world, sensor_pos, sensor_quat)
+    
+    # 水平方位角 (Azimuth) を計算: atan2(y, x) -> [-pi, pi]
+    # フロントがx軸正の方向の場合
+    angles_rad = np.arctan2(local_points[:, 1], local_points[:, 0])
+    angles_deg = np.degrees(angles_rad)
+    
+    # 判定範囲 [-fov/2, +fov/2]
+    half_fov = fov_deg / 2.0
+    mask = (angles_deg >= -half_fov) & (angles_deg <= half_fov)
+    
+    return points_world[mask]
     
 def debug_visualize_2d(sensor_pos, lidar_points, mirror_center, mirror_yaw, p_virtual):
 
@@ -330,6 +332,40 @@ def debug_visualize_2d(sensor_pos, lidar_points, mirror_center, mirror_yaw, p_vi
     plt.grid(True, linestyle=':', alpha=0.5)
     plt.pause(0.01) # 短い一時停止でアニメーション表示
 
+def calc_unstability(x, y, window_size=15, polyorder=2):
+
+    # 1. 隣接フレーム間の座標差分を計算
+    dx = np.diff(x)
+    dy = np.diff(y)
+
+    distances = np.sqrt(dx**2 + dy**2)
+    move_direction_rad = np.arctan2(dy, dx)
+
+    weighted_score = np.abs(move_direction_rad) * distances
+    weighted_consistent = np.insert(weighted_score, 0, 0.0)
+    
+    if np.max(weighted_consistent) > 0:
+        weighted_consistent /= np.max(weighted_consistent)
+    else:
+        pass
+
+    # 平滑化 & 正規化
+    if len(weighted_consistent) < window_size:
+        return weighted_consistent
+    
+    denoised_score = medfilt(weighted_consistent, kernel_size=5)
+    smoothed_score = savgol_filter(denoised_score, window_size, polyorder)
+
+    s_min = np.min(smoothed_score)
+    s_max = np.max(smoothed_score)
+    
+    if s_max - s_min > 1e-9:
+        normalized_score = (smoothed_score - s_min) / (s_max - s_min)
+    else:
+        normalized_score = np.zeros_like(smoothed_score)
+        
+    return normalized_score
+
 def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_swing_range=120, debug=False):
 
     # --- 設定読み込み ---
@@ -349,6 +385,9 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
     #num_gt, gt_x, gt_y, gt_z, gt_qw, gt_qx, gt_qy, gt_qz = load_files.load_benign_pose_csv(gt_path)
     gt_x, gt_y, gt_z, gt_qw, gt_qx, gt_qy, gt_qz = load_files.load_benign_pose(gt_path) # txt file
 
+    # moving unstability calculation
+    unstability = calc_unstability(gt_x, gt_y)
+
     # set mirror position
     mirror_height = get_sensor_height(gt_x, gt_y, gt_z, param_x, param_y)
     mirror_center = [param_x, param_y, mirror_height]
@@ -359,8 +398,7 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
     # score record variables
     occlusion_score_num = 0
     reflect_score_num = 0
-    anisotropic_score_num = 0
-    rotation_score_num = 0
+    unstability_score_num = 0
     
     # GTの1フレーム目から初期姿勢行列を作成
     initial_pos = np.array([gt_x[0], gt_y[0], gt_z[0]])
@@ -409,15 +447,15 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
                     lidar_points_world = np.vstack((wx, wy, wz)).T # Input point cloud : size (N, 3)
 
                     # 正規化用変数
-                    N_total = lidar_points_world.shape[0] # スキャン全体の点群数
+                    #N_total = lidar_points_world.shape[0] # スキャン全体の点群数
 
                     is_reflected = faster_check_intersection(
                         lidar_points_world, mirror_center, mirror_width, mirror_height, mirror_yaw_base, sensor_pos)      
 
                     P_visible, P_occlusion = lidar_points_world[~is_reflected], lidar_points_world[is_reflected]         
 
-                    occlusion_score = P_occlusion.shape[0] / N_total
-                    occlusion_score_num += occlusion_score # 鏡によって隠れる点群のscoreを合計
+                    #occlusion_score = P_occlusion.shape[0] / N_total
+                    #occlusion_score_num += occlusion_score # 鏡によって隠れる点群のscoreを合計
                     P_virtual_fov = np.empty((0, 3))
 
                     mirror_yaw = decide_mirror_yaw_triangular(mirror_yaw_base, swing_range, swing_speed, cnt / lidar_freq)
@@ -428,25 +466,28 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
                     P_virtual_raw, _ = reflection_sim(lidar_points_world, sensor_pos, sensor_quat, 
                                                         mirror_center, mirror_width, mirror_height, Rz)
                     
-                    simulated_points = np.vstack((P_visible, P_virtual_raw))
-                    #sim_local = coord_trans.world_to_local(simulated_points, sensor_pos, sensor_quat)
+                    #simulated_points = np.vstack((P_visible, P_virtual_raw))
 
-                    reflect_score = P_virtual_raw.shape[0] / N_total  # 鏡像反射により注入される点群数
+                    # P_visible, P_virtual_rawを水平方位角でフィルタする
+                    visible_fov = conditions['lidar']['horizontal_fov']
 
-                    reflect_score_num += reflect_score # SMVSの値が小さいほど脆弱な環境なので、smvsが大きいほどscoreを小さくする
+                    P_occlusion_filtered = filter_by_horizontal_fov(P_occlusion, sensor_pos, sensor_quat, visible_fov) # FOVでフィルタされた遮蔽点群    
+                    P_visible_filtered = filter_by_horizontal_fov(P_visible, sensor_pos, sensor_quat, visible_fov) # FOVでフィルタされた元点群
+                    P_virtual_filtered = filter_by_horizontal_fov(P_virtual_raw, sensor_pos, sensor_quat, visible_fov) # FOVでフィルタされた鏡像点群
 
-                    # 局在性の評価
-                    anisotropy, angle = eigen_decomposition.eigen_value_decomposition_2d(local_points)
-                    weight = (P_occlusion.shape[0]+P_virtual_raw.shape[0]) / N_total
-                    anisotropic_score = weight * anisotropy
-                    anisotropic_score_num += anisotropic_score
+                    N_total = P_occlusion_filtered.shape[0] + P_visible_filtered.shape[0]
+                    weight = (P_occlusion_filtered.shape[0]+P_virtual_filtered.shape[0]) / N_total # 鏡の影響を受ける点群数による重み
+                    simulated_points = np.vstack((P_visible_filtered, P_virtual_filtered))
 
-                    # yaw stability 方向転換中だと脆弱になりやすい
-                    yaw_stability = gt_qw[load_num] - np.abs(gt_qz[load_num]) # yaw 方向の方向転換の激しさ
-                    stability_score = weight * yaw_stability
-                    rotation_score_num += stability_score
+                    # 鏡像関連スコア計算
+                    occlusion_score = P_occlusion_filtered.shape[0] / N_total # 遮蔽スコア
+                    reflection_score = P_virtual_filtered.shape[0] / N_total # 反射スコア
 
-                    #print(f"frame:{cnt}:occlusion score:{occlusion_score:.4f}, reflection score:{reflect_score:.4f}, stability score:{stability_score:.4f}")
+                    occlusion_score_num += occlusion_score
+                    reflect_score_num += reflection_score
+
+                    # scan matching安定性スコア計算
+                    unstability_score_num += weight * unstability
 
                     # simulation debug
                     if debug:
@@ -459,5 +500,5 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
                     cnt += 1
 
     #overall_score = occlusion_score_num + reflect_score_num + anisotropic_score_num - rotation_score_num
-    overall_score = occlusion_score_num + reflect_score_num - rotation_score_num
+    overall_score = occlusion_score_num + reflect_score_num + unstability_score_num
     return overall_score
