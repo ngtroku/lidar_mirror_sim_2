@@ -154,13 +154,13 @@ def create_pointcloud2(points, seq, stamp_ns, frame_id, typestore):
                        data=data_array, is_dense=True)
 
 def generate_rosbag(param_x=8.0, param_y=0.0, param_yaw_center=0.0, param_swing_speed=0.0, param_swing_range=0.0):
-    with open('01_28_config.json', 'r') as f:
+    with open('config.json', 'r') as f:
         config = json.load(f)
 
     bag_path = Path(config['main']['bag_path'])
-    output_bag_path = Path(config['main']['output_file'])
-    lidar_topic_in = config['main']['lidar_topic']
-    lidar_topic_out = config['main']['lidar_topic']
+    output_bag_path = Path(config['main']['output_bag'])
+    lidar_topic_in = config['lidar']['lidar_topic']
+    lidar_topic_out = config['lidar']['lidar_topic']
     topic_length = config['lidar']['topic_length']
     lidar_freq = config['lidar']['frequency']
 
@@ -207,7 +207,17 @@ def generate_rosbag(param_x=8.0, param_y=0.0, param_yaw_center=0.0, param_swing_
                 Rz = np.array([[np.cos(y_rad), -np.sin(y_rad), 0], [np.sin(y_rad), np.cos(y_rad), 0], [0, 0, 1]])
 
                 P_virtual, _ = reflection_sim(lidar_points_world, sensor_pos, sensor_quat, mirror_center, mirror_width, mirror_height, Rz)
-                sim_world = np.vstack((P_visible, P_virtual))
+
+                dx = mirror_center[0] - sensor_pos[0]
+                dy = mirror_center[1] - sensor_pos[1]
+                # センサから鏡への方位角 (deg)
+                mirror_dir_from_sensor = np.degrees(np.arctan2(dy, dx))
+
+                if np.abs(mirror_dir_from_sensor) <= 90:
+                    sim_world = np.vstack((P_visible, P_virtual))
+                else:
+                    sim_world = lidar_points_world
+
                 sim_local = coord_trans.world_to_local(sim_world, sensor_pos, sensor_quat)
 
                 out_msg = create_pointcloud2(sim_local, cnt, msg_ns, msg.header.frame_id, typestore)
@@ -263,11 +273,18 @@ def objective(trial):
 
 if __name__ == "__main__":
 
+    with open('conditions.json', 'r') as f: conditions = json.load(f)
+
+    gt = conditions['main']['gt_path']
+    est = conditions['main']['est_path']
+    n_trials = int(conditions['simulation']['n_trials'])
+    n_random = n_trials * 0.30
+
     # generate pcd file
     preprocessing.rosbag_writer()
 
-    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(n_startup_trials=200))
-    study.optimize(objective, n_trials=500)
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(n_startup_trials=n_random))
+    study.optimize(objective, n_trials=n_trials)
 
     # --- ベストパラメータの表示 ---
     print("\n" + "="*30)
@@ -279,17 +296,14 @@ if __name__ == "__main__":
     print("="*30 + "\n")
 
     # --- ベストパラメータでシミュレーション --- 
-    best_param = study.best_params
-    best_x, best_y = best_param['mirror_pos_x'], best_param['mirror_pos_y']
-    #best_speed = best_param['mirror_swing_speed']
-    best_yaw = best_param['mirror_orientation_yaw']
+    best_param = study.best_trial
+    best_x = best_param.user_attrs["mx"]
+    best_y = best_param.user_attrs["my"]
+    
+    best_yaw = best_param.params["mirror_yaw"] 
 
     generate_rosbag(param_x=best_x, param_y=best_y, param_yaw_center=best_yaw, param_swing_speed=7.0, param_swing_range=120.0)
     run_slam()
-
-    # --- ベストパラメータによる自己位置推定結果をプロット
-    est = "/home/rokuto/lidar_mirror_sim/gradient_ascent/estimated_traj/temp.txt"
-    gt = "/home/rokuto/lidar_mirror_sim/gradient_ascent/01_28_benign.txt"
 
     gt_x, gt_y, gt_z, gt_qw, gt_qx, gt_qy, gt_qz = load_files.load_benign_pose(gt)
     est_x, est_y, est_z, est_qw, est_qx, est_qy, est_qz = load_files.load_benign_pose(est)

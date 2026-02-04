@@ -487,9 +487,13 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
 
                     """
                     plt.clf()
-                    # 1. シミュレーション点群のプロット（遮蔽点=青、鏡像点=赤）
-                    plt.scatter(P_visible[:, 0], P_visible[:, 1], s=2, c='blue', label='Raw points')
-                    plt.scatter(P_virtual_raw[:, 0], P_virtual_raw[:, 1], s=2, c='red', label='Virtual Points')
+
+                    if np.abs(mirror_dir_from_sensor) <= 90:
+                        # 1. シミュレーション点群のプロット（遮蔽点=青、鏡像点=赤）
+                        plt.scatter(P_visible[:, 0], P_visible[:, 1], s=2, c='blue', label='Raw points')
+                        plt.scatter(P_virtual_raw[:, 0], P_virtual_raw[:, 1], s=2, c='red', label='Virtual Points')
+                    else:
+                        plt.scatter(P_visible[:, 0], P_visible[:, 1], s=2, c='blue', label='Raw points')
                     
                     # 2. センサー位置（緑の点）
                     plt.scatter(sensor_pos[0], sensor_pos[1], s=100, c='green', marker='o', label='Sensor')
