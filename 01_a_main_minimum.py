@@ -284,6 +284,7 @@ if __name__ == "__main__":
     preprocessing.rosbag_writer()
 
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(n_startup_trials=n_random))
+    #study = optuna.create_study(direction='maximize')
     study.optimize(objective, n_trials=n_trials)
 
     # --- ベストパラメータの表示 ---
@@ -326,6 +327,10 @@ if __name__ == "__main__":
     rad = np.radians(best_yaw)
     dx = arrow_length * np.cos(rad)
     dy = arrow_length * np.sin(rad)
+
+    # 位置ずれを定量的に評価
+    RPE = error_estimate.evo_rpe_eval_results(gt, est)
+    print(f"RPE is {RPE} m")
     
     ax.arrow(best_x, best_y, dx, dy, width=1.0, head_width=4.0, head_length=5.0, 
              fc='red', ec='red', alpha=0.8, zorder=6, label='Mirror Orientation')

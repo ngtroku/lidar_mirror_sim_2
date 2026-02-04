@@ -13,6 +13,7 @@ from rosbags.typesys import Stores, get_typestore
 # import external functions
 import load_files
 import coord_trans
+import eigen_decomposition
 
 def binary_to_xyz(binary):
     """Livox custom binary to XYZ numpy array"""
@@ -354,7 +355,7 @@ def unstability(file, window_size=15, polyorder=2):
     if len(weighted_consistent) < window_size:
         return weighted_consistent
     
-    denoised = medfilt(weighted_consistent, kernel_size=5)
+    denoised = medfilt(weighted_consistent, kernel_size=9)
 
     # スパイクを抑えつつ、信号の立ち上がりなどを綺麗に残せる
     smoothed = savgol_filter(denoised, window_size, polyorder)
@@ -370,6 +371,32 @@ def unstability(file, window_size=15, polyorder=2):
         normalized_score = np.zeros_like(smoothed)
         
     return normalized_score
+
+def reflection_point_analysis(points, sensor_pos, sensor_quat):
+    local_points = coord_trans.world_to_local(points, sensor_pos, sensor_quat)
+
+    # 2. 原点 (0, 0, 0) からのユークリッド距離を計算
+    # 各点 P(x, y, z) に対して d = sqrt(x^2 + y^2 + z^2)
+    distances = np.linalg.norm(local_points, axis=1)
+
+    # 3. 統計量の算出
+    stats = {
+        "min": np.min(distances),
+        "max": np.max(distances),
+        "mean": np.mean(distances),
+        "median": np.median(distances),
+        "std": np.std(distances) # 標準偏差も追加
+    }
+
+    # 統計情報の表示
+    print(f"--- Point Cloud Distance Analysis ---")
+    print(f"Count  : {len(distances)} points")
+    print(f"Min    : {stats['min']:.3f} m")
+    print(f"Max    : {stats['max']:.3f} m")
+    print(f"Mean   : {stats['mean']:.3f} m")
+    print(f"Median : {stats['median']:.3f} m")
+    print(f"Std Dev: {stats['std']:.3f} m")
+
 
 def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_swing_range=120):
 
@@ -468,6 +495,14 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
                     
                     simulated_points = np.vstack((P_occlusion, P_virtual_raw))
 
+                    #if P_virtual_raw.shape[0] > 3000:
+                    #    reflection_point_analysis(P_virtual_raw, sensor_pos, sensor_quat)
+                    #else:
+                    #    pass
+
+                    # anisotropy
+                    anisotropy, angle = eigen_decomposition.eigen_value_decomposition_2d(local_points)
+
                     # debug visualization
                     dx = mirror_center[0] - sensor_pos[0]
                     dy = mirror_center[1] - sensor_pos[1]
@@ -479,7 +514,7 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
                         N_total = local_points.shape[0]
                         occlusion_score_num += (P_occlusion.shape[0] / N_total)
                         reflect_score_num += (P_virtual_raw.shape[0] / N_total)
-                        unstability_score_num += (((P_occlusion.shape[0] + P_virtual_raw.shape[0]) / N_total) * unstability_score_array[load_num])
+                        unstability_score_num += (((P_occlusion.shape[0] + P_virtual_raw.shape[0]) / N_total) * anisotropy)
                     else:
                         occlusion_score_num += 0
                         reflect_score_num += 0
@@ -530,7 +565,7 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
                     cnt += 1
 
     print(f"occ score:{occlusion_score_num:.3f} | ref score:{reflect_score_num:.3f} | uns score:{unstability_score_num:.3f}")
-    overall_score = occlusion_score_num + reflect_score_num + unstability_score_num # 鏡に隠れる点群と反射によって入り込む点群のscoreの和を計算
+    overall_score = occlusion_score_num + reflect_score_num + unstability_score_num  # 鏡に隠れる点群と反射によって入り込む点群のscoreの和を計算
     return overall_score
 
 def filter_by_azimuth(points, azimuth_limit=60):
