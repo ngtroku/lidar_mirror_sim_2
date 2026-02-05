@@ -153,14 +153,42 @@ def create_pointcloud2(points, seq, stamp_ns, frame_id, typestore):
                        is_bigendian=False, point_step=12, row_step=12 * points.shape[0],
                        data=data_array, is_dense=True)
 
+def filter_by_azimuth(points, azimuth_limit=90):
+    """
+    ローカル座標系のポイントクラウドを方位角でフィルター
+    
+    Args:
+        points: (N, 3) local_points (ローカル座標系)
+        azimuth_limit: 方位角の制限 (度, デフォルト±60度)
+    
+    Returns:
+        フィルタリングされたポイント
+    """
+    if len(points) == 0:
+        return points
+    
+    x = points[:, 0]
+    y = points[:, 1]
+    
+    azimuth = np.arctan2(y, x)
+    azimuth_limit_rad = np.deg2rad(azimuth_limit)
+    
+    mask = np.abs(azimuth) <= azimuth_limit_rad
+    
+    return points[mask]
+
 def generate_rosbag(param_x=8.0, param_y=0.0, param_yaw_center=0.0, param_swing_speed=0.0, param_swing_range=0.0):
     with open('config.json', 'r') as f:
         config = json.load(f)
 
     bag_path = Path(config['main']['bag_path'])
     output_bag_path = Path(config['main']['output_bag'])
+
     lidar_topic_in = config['lidar']['lidar_topic']
     lidar_topic_out = config['lidar']['lidar_topic']
+
+    imu_topic = config['imu']['imu_topic']
+
     topic_length = config['lidar']['topic_length']
     lidar_freq = config['lidar']['frequency']
 
@@ -181,7 +209,8 @@ def generate_rosbag(param_x=8.0, param_y=0.0, param_yaw_center=0.0, param_swing_
     with AnyReader([bag_path], default_typestore=typestore) as reader:
         with Writer(output_bag_path) as writer:
             lidar_conn_out = writer.add_connection(lidar_topic_out, 'sensor_msgs/msg/PointCloud2', typestore=typestore)
-            connections = [x for x in reader.connections if x.topic == lidar_topic_in]
+            imu_conn_out = writer.add_connection(imu_topic, 'sensor_msgs/msg/Imu', typestore=typestore)
+            connections = [x for x in reader.connections if x.topic == lidar_topic_in or x.topic == imu_topic]
 
             for connection, timestamp, rawdata in reader.messages(connections=connections):
                 if cnt >= max_frame_seq: break
@@ -189,43 +218,51 @@ def generate_rosbag(param_x=8.0, param_y=0.0, param_yaw_center=0.0, param_swing_
                 msg = reader.deserialize(rawdata, connection.msgtype)
                 msg_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
 
-                iteration = int(msg.data.shape[0]/topic_length)
-                bin_points = np.frombuffer(msg.data, dtype=np.uint8).reshape(iteration, topic_length)
-                lx, ly, lz = binary_to_xyz(bin_points)
-                local_points = np.vstack((lx, ly, lz)).T
+                if connection.topic == imu_topic:
+                    writer.write(imu_conn_out, msg_ns, rawdata)
+                    continue
+                
+                elif connection.topic == lidar_topic_in:
+                    iteration = int(msg.data.shape[0]/topic_length)
+                    bin_points = np.frombuffer(msg.data, dtype=np.uint8).reshape(iteration, topic_length)
+                    lx, ly, lz = binary_to_xyz(bin_points)
+                    local_points = np.vstack((lx, ly, lz)).T
 
-                sensor_pos = [gt_x[cnt], gt_y[cnt], gt_z[cnt]]
-                sensor_quat = [gt_qw[cnt], gt_qx[cnt], gt_qy[cnt], gt_qz[cnt]]
-                wx, wy, wz = coord_trans.local_to_world(local_points, sensor_pos, sensor_quat)
-                lidar_points_world = np.vstack((wx, wy, wz)).T
+                    sensor_pos = [gt_x[cnt], gt_y[cnt], gt_z[cnt]]
+                    sensor_quat = [gt_qw[cnt], gt_qx[cnt], gt_qy[cnt], gt_qz[cnt]]
+                    wx, wy, wz = coord_trans.local_to_world(local_points, sensor_pos, sensor_quat)
+                    lidar_points_world = np.vstack((wx, wy, wz)).T
 
-                is_reflected = faster_check_intersection(lidar_points_world, mirror_center, mirror_width, mirror_height, param_yaw_center, sensor_pos)
-                P_visible = lidar_points_world[~is_reflected]
+                    is_reflected = faster_check_intersection(lidar_points_world, mirror_center, mirror_width, mirror_height, param_yaw_center, sensor_pos)
+                    P_visible = lidar_points_world[~is_reflected]
 
-                m_yaw = decide_mirror_yaw_triangular(param_yaw_center, param_swing_range, param_swing_speed, cnt / lidar_freq)
-                y_rad = np.deg2rad(m_yaw)
-                Rz = np.array([[np.cos(y_rad), -np.sin(y_rad), 0], [np.sin(y_rad), np.cos(y_rad), 0], [0, 0, 1]])
+                    m_yaw = decide_mirror_yaw_triangular(param_yaw_center, param_swing_range, param_swing_speed, cnt / lidar_freq)
+                    y_rad = np.deg2rad(m_yaw)
+                    Rz = np.array([[np.cos(y_rad), -np.sin(y_rad), 0], [np.sin(y_rad), np.cos(y_rad), 0], [0, 0, 1]])
 
-                P_virtual, _ = reflection_sim(lidar_points_world, sensor_pos, sensor_quat, mirror_center, mirror_width, mirror_height, Rz)
+                    P_virtual, _ = reflection_sim(lidar_points_world, sensor_pos, sensor_quat, mirror_center, mirror_width, mirror_height, Rz)
 
-                dx = mirror_center[0] - sensor_pos[0]
-                dy = mirror_center[1] - sensor_pos[1]
-                # センサから鏡への方位角 (deg)
-                mirror_dir_from_sensor = np.degrees(np.arctan2(dy, dx))
+                    dx = mirror_center[0] - sensor_pos[0]
+                    dy = mirror_center[1] - sensor_pos[1]
+                    # センサから鏡への方位角 (deg)
+                    mirror_dir_from_sensor = np.degrees(np.arctan2(dy, dx))
 
-                if np.abs(mirror_dir_from_sensor) <= 90:
-                    sim_world = np.vstack((P_visible, P_virtual))
-                else:
-                    sim_world = lidar_points_world
+                    if np.abs(mirror_dir_from_sensor) <= 90:
+                        sim_world = np.vstack((P_visible, P_virtual))
+                    else:
+                        sim_world = lidar_points_world
 
-                sim_local = coord_trans.world_to_local(sim_world, sensor_pos, sensor_quat)
+                    sim_local = coord_trans.world_to_local(sim_world, sensor_pos, sensor_quat)
 
-                out_msg = create_pointcloud2(sim_local, cnt, msg_ns, msg.header.frame_id, typestore)
-                serialized_msg = typestore.serialize_ros1(out_msg, lidar_conn_out.msgtype)
-                writer.write(lidar_conn_out, msg_ns, serialized_msg)
-                cnt += 1
+                    # sim_local filtering
+                    sim_local_filtered = filter_by_azimuth(sim_local)
 
-def run_slam(algorithm='kiss_icp'):
+                    out_msg = create_pointcloud2(sim_local_filtered, cnt, msg_ns, msg.header.frame_id, typestore)
+                    serialized_msg = typestore.serialize_ros1(out_msg, lidar_conn_out.msgtype)
+                    writer.write(lidar_conn_out, msg_ns, serialized_msg)
+                    cnt += 1
+
+def run_slam(algorithm='fast_lio'):
     cmd = ["roslaunch", "slamspoof", "mirror_sim_kiss.launch"] if algorithm == 'kiss_icp' else ["roslaunch", "slamspoof", "mirror_sim_flio.launch"]
     print("SLAMを開始します...")
     try:

@@ -1,27 +1,28 @@
 {
   "main": {
     "bag_path": "/home/rokuto/01_28_outdoor.bag",
-    "output_directory": "/home/rokuto/lidar_mirror_sim/01_31_code/bags",
-    "output_bag": "/home/rokuto/lidar_mirror_sim/01_31_code/01_28_outdoor_sim.bag",
+    "output_directory": "/home/rokuto/lidar_mirror_sim/01_31_code/pcds",
+    "output_bag": "/home/rokuto/lidar_mirror_sim/01_31_code/sim.bag",
     "gt_path": "/home/rokuto/lidar_mirror_sim/01_31_code/01_28_benign.txt",
     "est_path": "/home/rokuto/lidar_mirror_sim/gradient_ascent/estimated_traj/temp.txt",
     "save_study_result": true,
     "visualize": true
   },
   "simulation": {
-    "distance": 1.0,
-    "n_trials": 500
+    "distance": 1.5,
+    "n_trials": 100
   },
   "lidar": {
     "lidar_topic": "/velodyne_points",
     "topic_length": 22,
-    "frequency": 10
+    "frequency": 10,
+    "horizontal_fov":360.0
   },
   "imu": {
     "imu_topic": "/imu"
   },
   "mirror": {
-    "width": 2.0,
-    "height": 0.8
+    "width": 0.0,
+    "height": 0.0
   }
 }

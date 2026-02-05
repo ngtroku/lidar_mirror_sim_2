@@ -1,0 +1,22 @@
+{
+  "main": {
+    "bag_path": "/home/rokuto/01_28_outdoor.bag",
+    "gt_path": "/home/rokuto/lidar_mirror_sim/01_31_code/01_28_benign.txt",
+    "est_path": "/home/rokuto/lidar_mirror_sim/gradient_ascent/estimated_traj/temp.txt",
+    "lidar_topic": "/velodyne_points",
+    "imu_topic": "/imu"
+  },
+  "mirror": {
+    "width": 0.0,
+    "height": 0.0
+  },
+  "lidar": {
+    "topic_length": 22,
+    "frequency": 10.0,
+    "fov": 360.0
+  },
+  "simulation":{
+    "distance": 1.5,
+    "n_trials": 100
+  }
+}

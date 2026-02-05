@@ -426,6 +426,9 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
 
     # --- 2. 初期姿勢(クオータニオン含む)の設定 ---
     cnt = 0
+    ema_occ = 0.0
+    ema_ref = 0.0
+    alpha = 0.3
 
     # score record variables
     occlusion_score_num, reflect_score_num, unstability_score_num = 0, 0, 0
@@ -510,15 +513,29 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
                     mirror_dir_from_sensor = np.degrees(np.arctan2(dy, dx))
 
                     if np.abs(mirror_dir_from_sensor) <= 90:
-                        # score calculation
+                        # 瞬間的なスコア（Current Frame Score）
                         N_total = local_points.shape[0]
-                        occlusion_score_num += (P_occlusion.shape[0] / N_total)
-                        reflect_score_num += (P_virtual_raw.shape[0] / N_total)
-                        unstability_score_num += (((P_occlusion.shape[0] + P_virtual_raw.shape[0]) / N_total) * anisotropy)
+                        instant_occ = (P_occlusion.shape[0] / N_total)
+                        instant_ref = (P_virtual_raw.shape[0] / N_total)
+
+                        # 指数移動平均（EMA）の更新
+                        # EMA = α * 今回のスコア + (1 - α) * 前回のEMA
+                        ema_occ = alpha * instant_occ + (1 - alpha) * ema_occ
+                        ema_ref = alpha * instant_ref + (1 - alpha) * ema_ref
+
+                        # 累積スコアにはEMA後の値を加算
+                        occlusion_score_num += ema_occ
+                        reflect_score_num += ema_ref
+                        
+                        # 不安定性スコア（もしここもEMAを使いたい場合は同様に適用）
+                        # unstability_score_num += ((ema_occ + ema_ref) * anisotropy)
                     else:
+                        # 鏡が視野外の時は、EMAを徐々に減衰させる（Leaky Integrator的な挙動）
+                        ema_occ *= (1 - alpha)
+                        ema_ref *= (1 - alpha)
+                        # 累積には加算しない（または0を加算）
                         occlusion_score_num += 0
                         reflect_score_num += 0
-                        unstability_score_num += 0
 
                     """
                     plt.clf()
@@ -564,8 +581,8 @@ def simulator(param_x, param_y, param_yaw_center, param_swing_speed=7.0, param_s
                     load_num += 1
                     cnt += 1
 
-    print(f"occ score:{occlusion_score_num:.3f} | ref score:{reflect_score_num:.3f} | uns score:{unstability_score_num:.3f}")
-    overall_score = occlusion_score_num + reflect_score_num + unstability_score_num  # 鏡に隠れる点群と反射によって入り込む点群のscoreの和を計算
+    print(f"occ score:{occlusion_score_num:.3f} | ref score:{reflect_score_num:.3f}")
+    overall_score = occlusion_score_num + reflect_score_num # 鏡に隠れる点群と反射によって入り込む点群のscoreの和を計算
     return overall_score
 
 def filter_by_azimuth(points, azimuth_limit=60):
